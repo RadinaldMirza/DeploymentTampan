@@ -36,8 +36,8 @@ ASSETS_DIR = BASE_DIR / "extracted_assets" / "figures"
 CSV_CANDIDATES = [
     BASE_DIR / "Dataset_Skripsi_Finals_Bismillah.csv",
     BASE_DIR / "data" / "Dataset_Skripsi_Finals_Bismillah.csv",
-    BASE_DIR / "gdp_data.csv",
-    BASE_DIR / "data" / "gdp_data.csv",
+    BASE_DIR / "Dataset_Skripsi_Finals_Bismillah.csv",
+    BASE_DIR / "data" / "Dataset_Skripsi_Finals_Bismillah.csv",
 ]
 
 MODELS = {
