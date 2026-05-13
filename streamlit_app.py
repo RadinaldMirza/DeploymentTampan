@@ -27,7 +27,7 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS & FALLBACK DATA
 # ─────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent
 HTML_FILE = BASE_DIR / "bab4_alur_analisis_sentimen.html"
 ASSETS_DIR = BASE_DIR / "extracted_assets" / "figures"
 
@@ -440,15 +440,22 @@ button[data-baseweb="tab"][aria-selected="true"] p {
 @st.cache_data(show_spinner=False)
 def load_html():
     """Load and parse the HTML file once."""
-    if not os.path.exists(HTML_FILE):
-        return None, None
     try:
         from bs4 import BeautifulSoup
-        with open(HTML_FILE, "r", encoding="utf-8") as f:
-            raw = f.read()
+
+        if not HTML_FILE.exists():
+            available_files = [p.name for p in BASE_DIR.iterdir()]
+            st.error(f"File HTML tidak ditemukan: {HTML_FILE}")
+            st.write("Isi folder saat deploy:", available_files)
+            return None, None
+
+        raw = HTML_FILE.read_text(encoding="utf-8")
         soup = BeautifulSoup(raw, "html.parser")
         return raw, soup
-    except Exception:
+
+    except Exception as e:
+        st.error("Gagal membaca file HTML.")
+        st.exception(e)
         return None, None
 
 
@@ -693,9 +700,9 @@ with st.sidebar:
 if not html_ok:
     st.error(f"**File tidak ditemukan:** `{HTML_FILE}`")
     st.info(
-        f"Pastikan file `{HTML_FILE}` berada **satu folder** dengan `app.py`, "
-        "kemudian jalankan ulang dashboard."
-    )
+    f"Pastikan file `{HTML_FILE.name}` berada **satu folder** dengan `{Path(__file__).name}`, "
+    "kemudian jalankan ulang dashboard."
+)
     st.stop()
 
 
