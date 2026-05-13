@@ -31,6 +31,15 @@ BASE_DIR = Path(__file__).resolve().parent
 HTML_FILE = BASE_DIR / "bab4_alur_analisis_sentimen.html"
 ASSETS_DIR = BASE_DIR / "extracted_assets" / "figures"
 
+# CSV dataset is used as the primary source for EDA because Jupyter HTML
+# tables are not always parsed reliably after deployment.
+CSV_CANDIDATES = [
+    BASE_DIR / "Dataset_Skripsi_Finals_Bismillah.csv",
+    BASE_DIR / "data" / "Dataset_Skripsi_Finals_Bismillah.csv",
+    BASE_DIR / "gdp_data.csv",
+    BASE_DIR / "data" / "gdp_data.csv",
+]
+
 MODELS = {
     "TF-IDF + SVM tanpa stemming": 0.823177,
     "TF-IDF + SVM dengan stemming": 0.817183,
@@ -437,26 +446,116 @@ button[data-baseweb="tab"][aria-selected="true"] p {
 # UTILITIES
 # ─────────────────────────────────────────────────────────────
 
+
 @st.cache_data(show_spinner=False)
 def load_html():
     """Load and parse the HTML file once."""
+    if not HTML_FILE.exists():
+        return None, None
     try:
         from bs4 import BeautifulSoup
-
-        if not HTML_FILE.exists():
-            available_files = [p.name for p in BASE_DIR.iterdir()]
-            st.error(f"File HTML tidak ditemukan: {HTML_FILE}")
-            st.write("Isi folder saat deploy:", available_files)
-            return None, None
-
-        raw = HTML_FILE.read_text(encoding="utf-8")
+        raw = HTML_FILE.read_text(encoding="utf-8", errors="replace")
         soup = BeautifulSoup(raw, "html.parser")
         return raw, soup
-
-    except Exception as e:
-        st.error("Gagal membaca file HTML.")
-        st.exception(e)
+    except Exception:
         return None, None
+
+
+@st.cache_data(show_spinner=False)
+def load_dataset():
+    """Load the main dataset from CSV.
+
+    The uploaded dataset uses semicolon separators. This function tries
+    several common locations and separators so the app is safer on
+    Streamlit Cloud.
+    """
+    for candidate in CSV_CANDIDATES:
+        if not candidate.exists():
+            continue
+
+        read_attempts = [
+            {"sep": ";", "encoding": "utf-8-sig", "engine": "python"},
+            {"sep": ",", "encoding": "utf-8-sig", "engine": "python"},
+            {"sep": None, "encoding": "utf-8-sig", "engine": "python"},
+        ]
+
+        for kwargs in read_attempts:
+            try:
+                df = pd.read_csv(candidate, on_bad_lines="skip", **kwargs)
+                if len(df) > 0 and len(df.columns) >= 2:
+                    return df, candidate
+            except Exception:
+                continue
+
+    return None, None
+
+
+def find_col(df, candidates):
+    """Find a column by case-insensitive candidate names."""
+    if df is None:
+        return None
+    lower_map = {str(c).lower().strip(): c for c in df.columns}
+    for c in candidates:
+        key = c.lower().strip()
+        if key in lower_map:
+            return lower_map[key]
+    return None
+
+
+def clean_text_for_words(text):
+    text = str(text).lower()
+    text = re.sub(r"http\S+|www\S+", " ", text)
+    text = re.sub(r"@\w+|#\w+", " ", text)
+    text = re.sub(r"[^a-zA-ZÀ-ÿ0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def top_words_from_series(series, n=20):
+    """Create simple top-word frequency table from a text Series."""
+    stopwords = {
+        "yang", "dan", "di", "ke", "dari", "ini", "itu", "untuk", "dengan",
+        "akan", "atau", "pada", "dalam", "karena", "jadi", "ada", "bisa",
+        "tidak", "ga", "gak", "yg", "ya", "aja", "saja", "the", "a", "of",
+        "to", "is", "ai", "artificial", "intelligence"
+    }
+    counts = {}
+    for value in series.dropna().astype(str):
+        for word in clean_text_for_words(value).split():
+            if len(word) < 3 or word in stopwords:
+                continue
+            counts[word] = counts.get(word, 0) + 1
+
+    if not counts:
+        return pd.DataFrame(columns=["kata", "frekuensi"])
+
+    rows = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:n]
+    return pd.DataFrame(rows, columns=["kata", "frekuensi"])
+
+
+def label_distribution_from_dataset(df):
+    """Return label distribution in a consistent Label/Jumlah format."""
+    label_col = find_col(df, ["manual_labeling", "label", "label_final", "sentimen", "sentiment"])
+    if df is None or label_col is None:
+        return None
+
+    order = ["netral", "ancaman", "peluang"]
+    counts = (
+        df[label_col]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .value_counts()
+    )
+
+    rows = []
+    for label in order:
+        if label in counts.index:
+            rows.append({"Label": label.capitalize(), "Jumlah": int(counts[label])})
+    for label, count in counts.items():
+        if label not in order:
+            rows.append({"Label": str(label).capitalize(), "Jumlah": int(count)})
+    return pd.DataFrame(rows)
 
 
 @st.cache_data(show_spinner=False)
@@ -485,38 +584,29 @@ def extract_images():
 
 @st.cache_data(show_spinner=False)
 def get_tables():
-    """Extract all HTML tables as DataFrames.
-
-    More robust than parsing table-by-table because Jupyter HTML tables
-    can contain complex attributes that make per-table parsing fail.
-    """
+    """Extract all HTML tables as DataFrames."""
     raw, soup = load_html()
     if raw is None:
         return {}
 
-    # Primary method: read all tables directly from the complete HTML.
     try:
         dfs = pd.read_html(StringIO(raw), flavor="lxml")
         return {i: df for i, df in enumerate(dfs)}
     except Exception:
         pass
 
-    # Fallback method: parse each <table> tag individually.
     result = {}
     if soup is not None:
         tables = soup.find_all("table")
         for i, t in enumerate(tables):
             try:
-                df = pd.read_html(StringIO(str(t)), flavor="lxml")[0]
-                result[i] = df
+                result[i] = pd.read_html(StringIO(str(t)), flavor="lxml")[0]
             except Exception:
                 try:
-                    df = pd.read_html(StringIO(str(t)))[0]
-                    result[i] = df
+                    result[i] = pd.read_html(StringIO(str(t)))[0]
                 except Exception:
                     pass
     return result
-
 
 def section_header(badge, title):
     st.markdown(f"""
@@ -629,12 +719,17 @@ def cr_metrics_bars(cr_text, model_name):
 # ─────────────────────────────────────────────────────────────
 # LOAD DATA
 # ─────────────────────────────────────────────────────────────
-with st.spinner("Memuat data notebook..."):
+with st.spinner("Memuat data notebook dan dataset..."):
     raw_html, soup = load_html()
     html_images = extract_images()
     all_tables = get_tables()
+    dataset_df, dataset_path = load_dataset()
 
 html_ok = raw_html is not None
+dataset_ok = dataset_df is not None
+total_data = len(dataset_df) if dataset_ok else 5001
+total_data_display = f"{total_data:,}".replace(",", ".")
+label_dist_df = label_distribution_from_dataset(dataset_df) if dataset_ok else None
 
 # ─────────────────────────────────────────────────────────────
 # SIDEBAR NAVIGATION
@@ -673,16 +768,23 @@ with st.sidebar:
             '<div style="font-size:0.72rem;color:#59A14F;">✅ File HTML berhasil dimuat</div>',
             unsafe_allow_html=True
         )
+    else:
         st.markdown(
-            f'<div style="font-size:0.72rem;color:#8b949e;">{len(html_images)} gambar diekstrak</div>',
+            '<div style="font-size:0.72rem;color:#F0C040;">⚠️ File HTML tidak ditemukan</div>',
+            unsafe_allow_html=True
+        )
+
+    if dataset_ok:
+        st.markdown(
+            f'<div style="font-size:0.72rem;color:#59A14F;">✅ Dataset CSV dimuat: {total_data_display} baris</div>',
             unsafe_allow_html=True
         )
     else:
         st.markdown(
-            '<div style="font-size:0.72rem;color:#E15759;">⚠️ File HTML tidak ditemukan</div>',
+            '<div style="font-size:0.72rem;color:#E15759;">⚠️ Dataset CSV tidak ditemukan</div>',
             unsafe_allow_html=True
         )
-        st.caption(f"Pastikan `{HTML_FILE}` berada satu folder dengan `app.py`")
+        st.caption("Upload Dataset_Skripsi_Finals_Bismillah.csv ke root repo atau folder data/")
 
     st.markdown("---")
     st.markdown("""
@@ -697,12 +799,13 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────
 # ERROR STATE
 # ─────────────────────────────────────────────────────────────
-if not html_ok:
-    st.error(f"**File tidak ditemukan:** `{HTML_FILE}`")
+if not html_ok and not dataset_ok:
+    st.error("**File utama tidak ditemukan:** HTML notebook dan Dataset CSV tidak tersedia.")
     st.info(
-    f"Pastikan file `{HTML_FILE.name}` berada **satu folder** dengan `{Path(__file__).name}`, "
-    "kemudian jalankan ulang dashboard."
-)
+        f"Pastikan `{HTML_FILE.name}` dan/atau `Dataset_Skripsi_Finals_Bismillah.csv` "
+        f"berada satu folder dengan `{Path(__file__).name}` atau di folder `data/`, "
+        "kemudian jalankan ulang dashboard."
+    )
     st.stop()
 
 
@@ -740,7 +843,7 @@ if selected_name == "Overview":
 
     kpi_cols = st.columns(5)
     kpi_data = [
-        ("Total Data", "5.001", "Tweet", "#4E79A7"),
+        ("Total Data", total_data_display, "Tweet", "#4E79A7"),
         ("Kategori Label", "3", "Ancaman · Peluang · Netral", "#F28E2B"),
         ("Skenario Model", "5", "Baseline + Fine-tuning", "#B07AA1"),
         ("Best Model", "IndoBERT", "Accuracy tertinggi", "#E15759"),
@@ -840,11 +943,11 @@ elif selected_name == "EDA":
 
     with tab1:
         st.markdown("#### 4.1 · Gambaran Umum Dataset")
-        st.markdown("""
+        st.markdown(f"""
         <div class="info-card">
             <div class="info-card-title">Sumber Data</div>
             <p style="color:#c9d1d9;font-size:0.88rem;line-height:1.7;margin:0;">
-                Dataset terdiri dari <strong>5.001 tweet</strong> berbahasa Indonesia yang membahas
+                Dataset terdiri dari <strong>{total_data_display} tweet</strong> berbahasa Indonesia yang membahas
                 Artificial Intelligence dalam konteks dunia kerja. Pengumpulan data dilakukan melalui
                 Twitter API dan pelabelan manual oleh tim peneliti dengan 3 kategori sentimen:
                 <strong>Ancaman</strong>, <strong>Peluang</strong>, dan <strong>Netral</strong>.
@@ -852,51 +955,69 @@ elif selected_name == "EDA":
         </div>
         """, unsafe_allow_html=True)
 
-        # Table 0: dataset preview
-        if 0 in all_tables:
-            df = all_tables[0]
-            # show only relevant columns
-            cols_show = [c for c in df.columns if c not in ["Unnamed: 0"] or True]
-            st.dataframe(df.head(5), use_container_width=True)
+        if dataset_ok:
+            st.markdown("##### Preview Dataset CSV")
+            preferred_cols = [
+                "created_at", "full_text", "manual_labeling",
+                "favorite_count", "tweet_url", "user_id_str"
+            ]
+            show_cols = [c for c in preferred_cols if c in dataset_df.columns]
+            if not show_cols:
+                show_cols = list(dataset_df.columns[:8])
+            st.dataframe(dataset_df[show_cols].head(10), use_container_width=True, hide_index=True)
+
+            st.markdown("#### Struktur Kolom Dataset")
+            struktur_df = pd.DataFrame({
+                "Kolom": dataset_df.columns,
+                "Tipe Data": dataset_df.dtypes.astype(str).values,
+                "Jumlah Non-Null": dataset_df.notna().sum().values,
+                "Jumlah Null": dataset_df.isna().sum().values,
+            })
+            st.dataframe(struktur_df, use_container_width=True, hide_index=True)
+
+            st.markdown("#### 4.3 · Hasil Data Cleansing")
+            text_col = find_col(dataset_df, ["full_text", "text", "tweet", "clean_text", "text_clean"])
+            label_col = find_col(dataset_df, ["manual_labeling", "label", "label_final", "sentimen"])
+            if text_col:
+                clean_preview = dataset_df[[c for c in [text_col, label_col] if c]].head(10).copy()
+                clean_preview["cleaned_preview"] = clean_preview[text_col].astype(str).map(clean_text_for_words)
+                st.dataframe(clean_preview, use_container_width=True, hide_index=True)
+            else:
+                st.info("Kolom teks tidak ditemukan di CSV.")
+        elif 0 in all_tables:
+            st.dataframe(all_tables[0].head(10), use_container_width=True)
         else:
-            st.info("Tabel preview dataset tidak tersedia dari HTML.")
-
-        # Table 1: kolom
-        st.markdown("#### Struktur Kolom Dataset")
-        if 1 in all_tables:
-            df1 = all_tables[1]
-            st.dataframe(df1, use_container_width=True)
-
-        # Table 2: data cleansing
-        st.markdown("#### 4.3 · Hasil Data Cleansing")
-        if 2 in all_tables:
-            df2 = all_tables[2]
-            st.dataframe(df2, use_container_width=True)
+            st.info("Dataset CSV belum ditemukan. Upload `Dataset_Skripsi_Finals_Bismillah.csv` ke root repo atau folder `data/`.")
 
     with tab2:
         st.markdown("#### 4.9.1 · Distribusi Label")
         col_tbl, col_chart = st.columns([1, 2])
 
-        label_data = {"Label": ["Netral", "Ancaman", "Peluang"], "Jumlah": [2070, 1723, 1208]}
+        if label_dist_df is not None and not label_dist_df.empty:
+            label_data = {
+                "Label": label_dist_df["Label"].tolist(),
+                "Jumlah": label_dist_df["Jumlah"].astype(int).tolist(),
+            }
+        else:
+            label_data = {"Label": ["Netral", "Ancaman", "Peluang"], "Jumlah": [2070, 1723, 1208]}
 
-        # Try from HTML table
-        if 10 in all_tables:
-            df_lbl = all_tables[10].copy()
-            try:
-                df_lbl.columns = df_lbl.columns.str.lower()
-                label_data = {
-                    "Label": df_lbl["label"].tolist(),
-                    "Jumlah": df_lbl["jumlah"].astype(int).tolist(),
-                }
-            except Exception:
-                pass
+            if 10 in all_tables:
+                df_lbl = all_tables[10].copy()
+                try:
+                    df_lbl.columns = df_lbl.columns.str.lower()
+                    label_data = {
+                        "Label": df_lbl["label"].tolist(),
+                        "Jumlah": df_lbl["jumlah"].astype(int).tolist(),
+                    }
+                except Exception:
+                    pass
 
         with col_tbl:
             st.dataframe(pd.DataFrame(label_data), use_container_width=True, hide_index=True)
-            total = sum(label_data["Jumlah"])
+            total = sum(label_data["Jumlah"]) if sum(label_data["Jumlah"]) else 1
             for lbl, cnt in zip(label_data["Label"], label_data["Jumlah"]):
                 pct = cnt / total * 100
-                color = LABEL_COLORS.get(lbl.lower(), "#8b949e")
+                color = LABEL_COLORS.get(str(lbl).lower(), "#8b949e")
                 st.markdown(f"""
                 <div style="display:flex;justify-content:space-between;align-items:center;
                             padding:0.3rem 0.6rem;margin-bottom:0.3rem;
@@ -912,7 +1033,7 @@ elif selected_name == "EDA":
                 values=label_data["Jumlah"],
                 hole=0.55,
                 marker=dict(colors=[
-                    LABEL_COLORS.get(l.lower(), "#8b949e")
+                    LABEL_COLORS.get(str(l).lower(), "#8b949e")
                     for l in label_data["Label"]
                 ]),
                 textfont=dict(color="#e6edf3", size=12),
@@ -926,14 +1047,13 @@ elif selected_name == "EDA":
                 margin=dict(l=10, r=10, t=10, b=10),
                 height=270,
                 annotations=[dict(
-                    text="5.001<br>Tweet",
+                    text=f"{sum(label_data['Jumlah']):,}".replace(",", ".") + "<br>Tweet",
                     x=0.5, y=0.5, font_size=15,
                     font_color="#e6edf3", showarrow=False
                 )]
             )
             st.plotly_chart(fig, use_container_width=True)
 
-        # Images from HTML (EDA: first ~2 images are likely EDA related)
         if html_images:
             st.markdown("#### Visualisasi dari Notebook")
             img_cols = st.columns(min(2, len(html_images)))
@@ -942,13 +1062,12 @@ elif selected_name == "EDA":
                     st.image(img_path, use_container_width=True)
 
     with tab3:
-        st.markdown("#### Top Words Sebelum Preprocessing")
-        if 3 in all_tables:
-            df_words = all_tables[3]
-            df_words.columns = [c.lower() for c in df_words.columns]
-            if "kata" in df_words.columns and "frekuensi" in df_words.columns:
-                df_words["frekuensi"] = pd.to_numeric(df_words["frekuensi"], errors="coerce")
-                df_words = df_words.dropna(subset=["frekuensi"]).sort_values("frekuensi", ascending=False).head(20)
+        text_col = find_col(dataset_df, ["full_text", "text", "tweet", "clean_text", "text_clean"]) if dataset_ok else None
+
+        st.markdown("#### Top Words dari Dataset CSV")
+        if text_col:
+            df_words = top_words_from_series(dataset_df[text_col], n=20)
+            if not df_words.empty:
                 fig = go.Figure(go.Bar(
                     x=df_words["frekuensi"],
                     y=df_words["kata"],
@@ -960,15 +1079,34 @@ elif selected_name == "EDA":
                     plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(color="#8b949e", size=11),
                     xaxis=dict(gridcolor="#21262d", linecolor="#30363d"),
-                    yaxis=dict(
-                        gridcolor="rgba(0,0,0,0)",
-                        linecolor="#30363d",
-                        autorange="reversed"
-                    ),
+                    yaxis=dict(gridcolor="rgba(0,0,0,0)", linecolor="#30363d", autorange="reversed"),
                     margin=dict(l=10, r=10, t=10, b=10),
-                    height=400,
+                    height=430,
                 )
                 st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(df_words, use_container_width=True, hide_index=True)
+            else:
+                st.info("Top words tidak dapat dibuat karena kolom teks kosong.")
+        elif 3 in all_tables:
+            df_words = all_tables[3]
+            df_words.columns = [c.lower() for c in df_words.columns]
+            if "kata" in df_words.columns and "frekuensi" in df_words.columns:
+                df_words["frekuensi"] = pd.to_numeric(df_words["frekuensi"], errors="coerce")
+                df_words = df_words.dropna(subset=["frekuensi"]).sort_values("frekuensi", ascending=False).head(20)
+                fig = go.Figure(go.Bar(
+                    x=df_words["frekuensi"], y=df_words["kata"],
+                    orientation="h", marker_color="#4E79A7",
+                ))
+                fig.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#8b949e", size=11),
+                    xaxis=dict(gridcolor="#21262d", linecolor="#30363d"),
+                    yaxis=dict(gridcolor="rgba(0,0,0,0)", linecolor="#30363d", autorange="reversed"),
+                    margin=dict(l=10, r=10, t=10, b=10), height=400,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Kolom teks tidak ditemukan di CSV dan tabel top words tidak tersedia dari HTML.")
 
         st.markdown("#### Top Words Setelah Preprocessing")
         if 9 in all_tables:
@@ -988,18 +1126,14 @@ elif selected_name == "EDA":
                     plot_bgcolor="rgba(0,0,0,0)",
                     font=dict(color="#8b949e", size=11),
                     xaxis=dict(gridcolor="#21262d", linecolor="#30363d"),
-                    yaxis=dict(
-                        gridcolor="rgba(0,0,0,0)",
-                        linecolor="#30363d",
-                        autorange="reversed"
-                    ),
+                    yaxis=dict(gridcolor="rgba(0,0,0,0)", linecolor="#30363d", autorange="reversed"),
                     margin=dict(l=10, r=10, t=10, b=10),
                     height=400,
                 )
                 st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.info("Tabel top words setelah preprocessing tidak tersedia dari HTML. Jika ingin menampilkan ini, tambahkan kolom hasil preprocessing ke CSV atau export tabel tersebut dari notebook.")
 
-
-# ─────────────────────────────────────────────────────────────
 # PAGE: PREPROCESSING
 # ─────────────────────────────────────────────────────────────
 elif selected_name == "Preprocessing":
@@ -1082,31 +1216,41 @@ elif selected_name == "Data Split":
         "test set digunakan untuk evaluasi akhir.",
     )
 
-    # Try from HTML table 11
-    split_data = {
-        "Label": ["Ancaman", "Peluang", "Netral", "Total"],
-        "Train": [1206, 845, 1449, 3500],
-        "Validation": [172, 121, 207, 500],
-        "Test": [345, 242, 414, 1001],
-    }
-    if 11 in all_tables:
-        try:
-            df_split = all_tables[11].copy()
-            df_split.columns = df_split.iloc[0]
-            df_split = df_split[1:].reset_index(drop=True)
-        except Exception:
-            pass
+    if label_dist_df is not None and not label_dist_df.empty:
+        split_rows = []
+        for _, row in label_dist_df.iterrows():
+            label = row["Label"]
+            total_label = int(row["Jumlah"])
+            train_n = int(round(total_label * 0.70))
+            val_n = int(round(total_label * 0.10))
+            test_n = total_label - train_n - val_n
+            split_rows.append({"Label": label, "Train": train_n, "Validation": val_n, "Test": test_n})
+        split_data = pd.DataFrame(split_rows)
+        split_data.loc[len(split_data)] = {
+            "Label": "Total",
+            "Train": int(split_data["Train"].sum()),
+            "Validation": int(split_data["Validation"].sum()),
+            "Test": int(split_data["Test"].sum()),
+        }
+    else:
+        split_data = pd.DataFrame({
+            "Label": ["Ancaman", "Peluang", "Netral", "Total"],
+            "Train": [1206, 845, 1449, 3500],
+            "Validation": [172, 121, 207, 500],
+            "Test": [345, 242, 414, 1001],
+        })
 
     col_tbl, col_chart = st.columns([1, 1.5])
 
     with col_tbl:
         st.markdown("#### Distribusi per Label")
-        df_show = pd.DataFrame(split_data)
-        st.dataframe(df_show, use_container_width=True, hide_index=True)
+        st.dataframe(split_data, use_container_width=True, hide_index=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown("#### Ringkasan Split")
-        for split_name, total, pct in [("Train", 3500, "70%"), ("Validation", 500, "10%"), ("Test", 1001, "20%")]:
+        totals = split_data[split_data["Label"] == "Total"].iloc[0]
+        for split_name, pct in [("Train", "70%"), ("Validation", "10%"), ("Test", "20%")]:
+            total = int(totals[split_name])
             color = {"Train": "#59A14F", "Validation": "#F28E2B", "Test": "#E15759"}[split_name]
             st.markdown(f"""
             <div style="display:flex;justify-content:space-between;align-items:center;
@@ -1119,18 +1263,12 @@ elif selected_name == "Data Split":
 
     with col_chart:
         st.markdown("#### Visualisasi Distribusi")
-        labels_plot = ["Ancaman", "Peluang", "Netral"]
-        train_vals = [1206, 845, 1449]
-        val_vals = [172, 121, 207]
-        test_vals = [345, 242, 414]
+        plot_df = split_data[split_data["Label"] != "Total"].copy()
 
         fig = go.Figure()
-        fig.add_trace(go.Bar(name="Train", x=labels_plot, y=train_vals,
-                             marker_color="#59A14F"))
-        fig.add_trace(go.Bar(name="Validation", x=labels_plot, y=val_vals,
-                             marker_color="#F28E2B"))
-        fig.add_trace(go.Bar(name="Test", x=labels_plot, y=test_vals,
-                             marker_color="#E15759"))
+        fig.add_trace(go.Bar(name="Train", x=plot_df["Label"], y=plot_df["Train"], marker_color="#59A14F"))
+        fig.add_trace(go.Bar(name="Validation", x=plot_df["Label"], y=plot_df["Validation"], marker_color="#F28E2B"))
+        fig.add_trace(go.Bar(name="Test", x=plot_df["Label"], y=plot_df["Test"], marker_color="#E15759"))
         fig.update_layout(
             barmode="group",
             paper_bgcolor="rgba(0,0,0,0)",
@@ -1145,12 +1283,12 @@ elif selected_name == "Data Split":
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Stacked total
+        totals = split_data[split_data["Label"] == "Total"].iloc[0]
         fig2 = go.Figure(go.Bar(
             x=["Train", "Validation", "Test"],
-            y=[3500, 500, 1001],
+            y=[int(totals["Train"]), int(totals["Validation"]), int(totals["Test"])],
             marker_color=["#59A14F", "#F28E2B", "#E15759"],
-            text=[3500, 500, 1001],
+            text=[int(totals["Train"]), int(totals["Validation"]), int(totals["Test"])],
             textposition="auto",
             textfont=dict(color="white", size=13, family="DM Sans"),
         ))
@@ -1165,8 +1303,6 @@ elif selected_name == "Data Split":
         )
         st.plotly_chart(fig2, use_container_width=True)
 
-
-# ─────────────────────────────────────────────────────────────
 # PAGE: BASELINE TF-IDF + SVM
 # ─────────────────────────────────────────────────────────────
 elif selected_name == "Baseline TF-IDF + SVM":
